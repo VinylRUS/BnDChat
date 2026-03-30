@@ -123,6 +123,9 @@ class MatrixService:
     def connect(self, homeserver: str, user: str, password: str):
         if self.running:
             self.stop()
+        if self._should_use_demo(homeserver, user, password):
+            self._connect_demo(user)
+            return
 
         try:
             from nio import (  # pylint: disable=import-outside-toplevel
@@ -197,6 +200,33 @@ class MatrixService:
     def stop(self):
         self.running = False
         self.connected = False
+        self.client = None
+        self.demo_mode = False
+
+    def _should_use_demo(self, homeserver: str, user: str, password: str) -> bool:
+        hs = homeserver.strip().lower()
+        return hs in {"demo", "sandbox", "mock"} or user.startswith("@sandbox") or password == "sandbox"
+
+    def _connect_demo(self, user: str):
+        self.running = True
+        self.connected = True
+        self.demo_mode = True
+        self.client = None
+        self.rooms = {
+            "!general:sandbox": MatrixRoom("!general:sandbox", "Песочница / Общий"),
+            "!qa:sandbox": MatrixRoom("!qa:sandbox", "Песочница / QA"),
+        }
+        self._emit_rooms()
+        if self.on_message:
+            demo_user = user or "@sandbox-user:local"
+            self.on_message(
+                {
+                    "sender": "@sandbox-bot:local",
+                    "room_id": "!general:sandbox",
+                    "body": f"Сэндбокс включён. Тестовый юзер: {demo_user}",
+                    "mine": False,
+                }
+            )
 
     async def _sync_once(self):
         if not self.client:
@@ -210,6 +240,17 @@ class MatrixService:
             self._next_batch = response.next_batch
 
     def send_message(self, text: str, room_id: str):
+        if self.demo_mode:
+            if self.on_message:
+                self.on_message(
+                    {
+                        "sender": "@sandbox-bot:local",
+                        "room_id": room_id,
+                        "body": f"Эхо от тестового сервера: {text}",
+                        "mine": False,
+                    }
+                )
+            return
         if not self.running or not self.client:
             return
         if self._loop and self._loop.is_running():
@@ -229,6 +270,12 @@ class MatrixService:
         return future.result(timeout=timeout)
 
     def create_room(self, room_name: str, is_public: bool):
+        if self.demo_mode:
+            slug = room_name.strip().lower().replace(" ", "-") or "new-room"
+            room_id = f"!{slug}:sandbox"
+            self.rooms[room_id] = MatrixRoom(room_id=room_id, display_name=f"Песочница / {room_name}")
+            self._emit_rooms()
+            return room_id
         preset = "public_chat" if is_public else "private_chat"
         visibility = "public" if is_public else "private"
         response = self.run_admin_action(
@@ -240,6 +287,12 @@ class MatrixService:
         raise RuntimeError(getattr(response, "message", "Не удалось создать комнату"))
 
     def get_joined_members(self, room_id: str):
+        if self.demo_mode:
+            return [
+                ("Sandbox Admin", "@sandbox-admin:local"),
+                ("Sandbox User", "@sandbox-user:local"),
+                ("Echo Bot", "@sandbox-bot:local"),
+            ]
         response = self.run_admin_action(self.client.joined_members(room_id))
         if not hasattr(response, "members"):
             raise RuntimeError(getattr(response, "message", "Не удалось получить участников"))
@@ -259,6 +312,8 @@ class MatrixService:
         return response.content
 
     def is_admin_in_room(self, room_id: str):
+        if self.demo_mode:
+            return True
         if not self.client or not self.client.user_id:
             return False
         try:
@@ -273,16 +328,22 @@ class MatrixService:
         return my_level >= max(kick_level, ban_level)
 
     def kick_user(self, room_id: str, user_id: str, reason: str):
+        if self.demo_mode:
+            return
         response = self.run_admin_action(self.client.room_kick(room_id, user_id, reason=reason))
         if response.__class__.__name__.endswith("Error"):
             raise RuntimeError(getattr(response, "message", "Не удалось кикнуть пользователя"))
 
     def ban_user(self, room_id: str, user_id: str, reason: str):
+        if self.demo_mode:
+            return
         response = self.run_admin_action(self.client.room_ban(room_id, user_id, reason=reason))
         if response.__class__.__name__.endswith("Error"):
             raise RuntimeError(getattr(response, "message", "Не удалось забанить пользователя"))
 
     def unban_user(self, room_id: str, user_id: str):
+        if self.demo_mode:
+            return
         response = self.run_admin_action(self.client.room_unban(room_id, user_id))
         if response.__class__.__name__.endswith("Error"):
             raise RuntimeError(getattr(response, "message", "Не удалось разбанить пользователя"))
@@ -360,6 +421,7 @@ class BnDChatWindow(QMainWindow):
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setPlaceholderText("Matrix password")
         self.password_input.setText(os.getenv("MATRIX_PASSWORD", ""))
+        self.password_input.setToolTip("Для тестового режима можно указать пароль: sandbox")
 
         connect_btn = QPushButton("Подключиться к Matrix")
         connect_btn.clicked.connect(self._connect_matrix)
@@ -495,10 +557,13 @@ class BnDChatWindow(QMainWindow):
         hs = self.hs_input.text().strip()
         user = self.login_input.text().strip()
         password = self.password_input.text()
-        if not hs or not user or not password:
+        demo_requested = self.matrix._should_use_demo(hs, user, password)
+        if not hs or not user or (not password and not demo_requested):
             QMessageBox.warning(self, APP_NAME, "Укажи homeserver, логин и пароль")
             return
         self.current_user_id = user
+        if demo_requested:
+            self._append_system("Включён тестовый sandbox-режим (эмуляция сервера и тестовый пользователь).")
         self._append_system(f"Подключение к Matrix: {hs} как {user}")
         try:
             self.matrix.connect(hs, user, password)
