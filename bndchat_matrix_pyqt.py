@@ -83,13 +83,11 @@ class MatrixRoom:
 
 
 class MatrixService:
-    """Минимальный async-адаптер для Matrix.
+    """Рабочий адаптер Matrix поверх matrix-nio.
 
-    По умолчанию работает в демо-режиме без сети.
-    Чтобы подключить реальный Matrix:
-    - install: pip install matrix-nio[e2e]
-    - установить переменные окружения:
-      MATRIX_HOMESERVER, MATRIX_USER, MATRIX_PASSWORD
+    - Подключается к Synapse / Matrix homeserver по логину и паролю.
+    - Подтягивает список joined-комнат.
+    - Отправляет и получает события m.room.message (msgtype m.text).
     """
 
     def __init__(self):
@@ -97,34 +95,126 @@ class MatrixService:
         self.on_rooms = None
         self.running = False
         self.connected = False
-        self.demo_mode = True
+        self.demo_mode = False
+        self.client = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._worker_thread: Optional[threading.Thread] = None
+        self._sync_timeout_ms = 30_000
+        self._next_batch = None
         self.rooms: Dict[str, MatrixRoom] = {
             "!general:local": MatrixRoom("!general:local", "Общий чат"),
             "!admins:local": MatrixRoom("!admins:local", "Админская"),
         }
 
-    def start(self):
+    def connect(self, homeserver: str, user: str, password: str):
+        if self.running:
+            self.stop()
+
+        try:
+            from nio import (  # pylint: disable=import-outside-toplevel
+                AsyncClient,
+                LoginError,
+                LoginResponse,
+                MatrixRoom as NioRoom,
+                RoomMessageText,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "Не найден matrix-nio. Установи зависимости: pip install matrix-nio[e2e]"
+            ) from exc
+
         self.running = True
-        self.connected = True
-        self._emit_rooms()
+        self.connected = False
+
+        def worker():
+            import asyncio  # pylint: disable=import-outside-toplevel
+
+            async def run():
+                self.client = AsyncClient(homeserver, user)
+                login = await self.client.login(password=password, device_name="BnDChat Desktop")
+                if isinstance(login, LoginError):
+                    self.running = False
+                    raise RuntimeError(f"Ошибка Matrix login: {login.message}")
+                if not isinstance(login, LoginResponse):
+                    self.running = False
+                    raise RuntimeError("Неожиданный ответ при авторизации Matrix")
+
+                self.connected = True
+                await self._sync_once()
+                self._emit_rooms()
+
+                def on_room_message(room: NioRoom, event: RoomMessageText):
+                    if getattr(event, "decrypted", True) is False:
+                        return
+                    if self.on_message:
+                        self.on_message(
+                            {
+                                "sender": event.sender,
+                                "room_id": room.room_id,
+                                "body": event.body,
+                                "mine": event.sender == self.client.user_id,
+                            }
+                        )
+
+                self.client.add_event_callback(on_room_message, RoomMessageText)
+
+                while self.running:
+                    try:
+                        await self._sync_once()
+                        self._emit_rooms()
+                    except Exception:
+                        # Не валим поток из-за единичной сетевой ошибки.
+                        await asyncio.sleep(2)
+
+                await self.client.close()
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            try:
+                loop.run_until_complete(run())
+            finally:
+                self._loop = None
+                loop.close()
+
+        self._worker_thread = threading.Thread(target=worker, daemon=True)
+        self._worker_thread.start()
 
     def stop(self):
         self.running = False
+        self.connected = False
+
+    async def _sync_once(self):
+        if not self.client:
+            return
+        response = await self.client.sync(
+            timeout=self._sync_timeout_ms,
+            since=self._next_batch,
+            full_state=False,
+        )
+        if getattr(response, "next_batch", None):
+            self._next_batch = response.next_batch
 
     def send_message(self, text: str, room_id: str):
-        if not self.running:
+        if not self.running or not self.client:
             return
-        if self.on_message:
-            self.on_message(
-                {
-                    "sender": "you",
-                    "room_id": room_id,
-                    "body": text,
-                    "mine": True,
-                }
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.client.room_send(
+                    room_id=room_id,
+                    message_type="m.room.message",
+                    content={"msgtype": "m.text", "body": text},
+                ),
+                self._loop,
             )
 
     def _emit_rooms(self):
+        if self.client and self.client.rooms:
+            mapped = {}
+            for room_id, room in self.client.rooms.items():
+                display_name = room.display_name or room.room_id
+                mapped[room_id] = MatrixRoom(room_id=room_id, display_name=display_name)
+            self.rooms = mapped
         if self.on_rooms:
             self.on_rooms(list(self.rooms.values()))
 
@@ -141,8 +231,7 @@ class BnDChatWindow(QMainWindow):
         self.rooms: Dict[str, MatrixRoom] = {}
 
         self._build_ui()
-        self.matrix.start()
-        self._append_system("Matrix-адаптер запущен. Внешний вид сохранён из старой версии BnDChat.")
+        self._append_system("Готово к подключению Matrix (Synapse).")
 
     def closeEvent(self, event):
         self.matrix.stop()
@@ -174,12 +263,13 @@ class BnDChatWindow(QMainWindow):
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setPlaceholderText("Matrix password")
+        self.password_input.setText(os.getenv("MATRIX_PASSWORD", ""))
 
         connect_btn = QPushButton("Подключиться к Matrix")
         connect_btn.clicked.connect(self._connect_matrix)
 
         self.room_select = QComboBox()
-        self.room_select.addItem("Общий чат", "!general:local")
+        self.room_select.addItem("Нет комнаты", "")
 
         self.room_list = QTextEdit()
         self.room_list.setReadOnly(True)
@@ -235,17 +325,35 @@ class BnDChatWindow(QMainWindow):
     def _connect_matrix(self):
         hs = self.hs_input.text().strip()
         user = self.login_input.text().strip()
-        if not hs or not user:
-            QMessageBox.warning(self, APP_NAME, "Укажи homeserver и логин")
+        password = self.password_input.text()
+        if not hs or not user or not password:
+            QMessageBox.warning(self, APP_NAME, "Укажи homeserver, логин и пароль")
             return
-        self._append_system(f"Подключение к Matrix: {hs} как {user} (демо-режим)")
+        self._append_system(f"Подключение к Matrix: {hs} как {user}")
+        try:
+            self.matrix.connect(hs, user, password)
+        except RuntimeError as err:
+            QMessageBox.critical(self, APP_NAME, str(err))
+            return
+        self._append_system("Matrix login отправлен, ожидай синхронизацию комнат...")
 
     def _send_message(self):
         text = self.message_input.text().strip()
         if not text:
             return
         room_id = self.room_select.currentData()
+        if not room_id:
+            QMessageBox.warning(self, APP_NAME, "Выбери комнату")
+            return
         self.matrix.send_message(text, room_id)
+        self._handle_message(
+            {
+                "sender": "you",
+                "room_id": room_id,
+                "body": text,
+                "mine": True,
+            }
+        )
         self.message_input.clear()
 
     def _handle_rooms(self, rooms: List[MatrixRoom]):
